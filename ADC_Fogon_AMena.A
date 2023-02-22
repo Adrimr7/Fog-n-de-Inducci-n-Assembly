@@ -1,0 +1,1018 @@
+
+;______________EQUS______________
+; Registros y variables utiles
+
+TEMP			EQU	R3		; guardamos la temperatura del fogon en el registro
+ESTADO			EQU 	R4		; el estado inicial sera el 0 siempre, usaremos el registro
+						; estado para mover de estados usando el RL y un salto incondicional
+EVENTO			EQU	R5		; el evento inicial sera el 0 siempre
+POTENCIA		EQU	R6		; la potencia se tiene que guardar en un registro
+POTANT			EQU	R7		; igual que la potencia anterior que se usará para cuando se retire el
+						; recipiente de manera repentina, para no perder la potencia efectiva
+DISPLAY			EQU 	0x27		; aqui guardaremos la informacion que ira al display de 7 segmentos
+ON			EQU	0x28		; guardaremos un 1 si el fogón está encendido y un 0 al contrario
+PARPADEO		EQU	0x29		; guardaremos un 1 si hay que parpadear y un 0 cuando no haya que hacerlo
+T0REG0                  EQU     0x2A            ; usaremos estas dos direcciones para guardar el estado en el que esta
+T0REG1                  EQU     0x2B            ; el timer 0, para poder usarlos en el contador
+SEGUNDOS		EQU	0x2C		; usaremos estos bits para guardar los segundos que lleva recorridos
+
+
+B_MENOS                 EQU     0x7F
+B_MAS                   EQU     0x7E
+
+
+;RECIPIENTE		EQU	0x42.2		; guardaremos un 1 si hay el recipiente está y un 0 cuando no esté
+
+;______________INFORMACION UTIL______________
+; Las flags de las interrupciones externas, boton on off y sensor de recipiente
+; son las siguientes,   TCON.0 , TCON.2
+; Las flags de los timers T0 y T1
+; son las siguientes,   TCON.5 , TCON.7
+; usar RETI en las interrupciones
+; poner a 1 el PCON.0  para acceder al modo IDL
+; en la interrupcion del boton on off, activar o desactivar
+; si la temp es alta y hay off, hay que comprobar la temp antes de
+; mandar el micro a reposo
+; Flag de interrupcion de ADC es ADCI
+
+
+
+; Constante de tiempo del timer
+CT0REG0                 EQU     0x2D                    ; esta sera la constante del timer, que se necesita para saber
+					                ; cuando el timer ha llegado a un punto en concreto (1 segundo en este caso)
+
+
+
+
+; Pines de los botones (OnOff, + y -)
+P_MAS			EQU	P3.0
+P_MENOS			EQU	P3.1
+P_ONOFF			EQU	P3.2			; no sirve en principio
+
+; Pines de salidas (led, el buzzer y los siete segmentos)
+LED			EQU	P2.0
+ZUMBADOR		EQU	P2.1
+SIETE_S_A		EQU	P0.0
+SIETE_S_B		EQU	P0.1
+SIETE_S_C		EQU	P0.2
+SIETE_S_D		EQU	P0.3
+SIETE_S_E		EQU	P0.4
+SIETE_S_F		EQU	P0.5
+SIETE_S_G		EQU	P0.6
+
+
+; Pines de sensores (sensor de recipiente y el de temperatura)
+P_S_RECIP		EQU	P3.3		; estos puertos de entrada no se pueden cambiar
+;P_S_TEMP		EQU	0xC4.0		
+
+
+; Estos son los pines de los timers (T0 y T1)
+P_T0			EQU	P3.4
+P_T1			EQU	P3.5
+
+; Los distintos PWM que usaremos
+PWM0			EQU	0xFC
+PWMP			EQU	0xFE
+
+
+; Flag del Analogic Digital Conversor, a partir de ahora nombrado como ADC
+F_ADC			EQU	0x2F.1
+
+; Aqui iran las flags de las distintas interrupciones de timers que usaremos
+F_200MS			EQU	0x2F.2
+F_500MS			EQU	0x2F.3
+F_1S			EQU	0x2F.4
+F_15S			EQU	0x2F.5
+F_30S			EQU	0x2F.6
+F_60S			EQU	0x2F.7
+
+; Otras equs relacionadas con el ADC
+ADCON			EQU	0xC5
+EAD			EQU	0xA8.6
+ADCH			EQU	0xC6
+
+IEN0			EQU	0XA8
+P5			EQU	0xC4
+
+
+
+ORG 0x00					; hace que la primera instruccion este en esa posicion de memoria
+	AJMP 	PROG_PRINCIPAL
+
+	
+
+ORG 0x03					;______________INTERRUPCION del ON OFF______________
+
+	ACALL	INT_ONOFF			; llamamos a una subrutina
+
+RETI		
+						; Se hacen en esta posicion de memoria para evitar problemas de espacio
+
+ORG 0x0B					;______________INTERRUPCION de TIMER______________
+	ACALL	INT_TIMER
+
+RETI						; una reti no es como un ret normal sino que ademas de hacer 
+						; las funciones de return, resetea las prioridades de la rutina
+						; de atencion a la interrupcion
+
+ORG 0x53
+	ACALL	INT_ADC				;______________INTERRUPCION del ADC______________
+
+RETI						; una reti no es como un ret normal sino que ademas de hacer 
+						; las funciones de return, resetea las prioridades de la rutina
+						; de atencion a la interrupcion
+
+ORG 0x90
+
+PROG_PRINCIPAL:					; Se hace una call al programa principal
+	ACALL 	INICIALIZAR
+	LAZO_PRINCIPAL:
+	ACALL 	MAQ_ESTADOS
+	AJMP 	LAZO_PRINCIPAL			; Desde aqui se llama a la maquina de estados y se hace un bucle
+						; para que el programa no acabe nunca
+
+						;______________INICIALIZAR______________
+INICIALIZAR:
+
+       	SETB	TCON.0                          ; configurar el puerto 3 para que se active por flanco descendente
+                                                ; y no por nivel bajo que es como está de inicio
+	MOV	ON,             #01h
+        MOV 	TL0, 		#3Ch		; valor de precarga para que el timer salte cada 0.025s
+	MOV 	TH0, 		#3Ch		; 
+	MOV	P3,		#0F0h		; ponemos el puerto a los valores que nos interesan
+        MOV     P0,             #00h            ; Ponemos todo el display a cero, 
+	MOV 	EVENTO,	 	#00h		; Ponemos un cero en los registros estado, evento, potencia y potencia anterior
+	MOV 	ESTADO,	 	#00h		; 
+	MOV 	POTENCIA,	#00h		;
+	MOV 	POTANT,	 	#00h		;
+	MOV  	TMOD,           #01h	        ; T0 se pone a modo timer de 16 bits
+	MOV	SEGUNDOS,	#00h
+        MOV     CT0REG0,        #28h            ; Con este numero de bits conseguimos que el tiempo del contador sea de 1 segundo
+	CLR 	P_S_RECIP			; se pone a valor de reset el sensor del recipiente
+	CLR	ZUMBADOR			; poner a cero el sonido del zumbador
+	CLR	F_1S				; limpiar todas las flags
+	CLR	F_15S
+	CLR	F_30S
+	CLR	F_60S
+	CLR	P_ONOFF				; limpiar lo que haya en el pin on/off
+	CLR	P5				; todo el puerto 5 a 0
+	CLR     P_MAS
+        CLR     P_MENOS
+	
+	SETB   	IE.7 				; habilita todas las interrupciones
+	SETB	EAD
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2	
+	SETB   	IE.1 				; habilita la interrupcion T0
+        SETB    ET0                             ; habilita la interrupcion por overflow del timer 0
+	SETB    EA                              ; habilita que cada interrupcion se habilite individualmente	
+	ANL     ADCON,          #0E7h		; poner el adc al canal 000 y ADCI a 0
+	ORL	ADCON,		#08h		; iniciar la conversión del adc
+
+	ORL     PCON,           #01h            ; Se inicializa en el idle mode
+			
+	RET
+
+MAQ_ESTADOS:					;______________MAQUINA de ESTADOS______________ 
+	
+	MOV 	A, 		ESTADO		; La estructura de la maquina de estados es similar a la de la plantilla
+	RL 	A				; el estado al acumulador y se desplaza a la izquierda para poder saltar
+	MOV 	DPTR, 		#LISTA_ESTADOS	; de egela. Simplemente se mueve el valor del registro que contiene 
+	JMP 	@A+DPTR				; al estado correspondiente. Ademas se mueve el contenido del anterior
+						; estado para saltar correspondiente a el tambien
+
+LISTA_ESTADOS:					;______________LISTA de ESTADOS______________ 	
+
+	AJMP 	REPOSO				; Estado 0: Reposo (IDL)
+	AJMP 	DETECCION			; Estado 1: Deteccion
+	AJMP 	ENC_SP				; Estado 2: Encendido sin potencia
+	AJMP 	ENC_CP				; Estado 3: Encendido con potencia
+	AJMP 	TEMP_ALTA			; Estado 4: Temperatura alta
+
+
+						;______________ESTADO 0: REPOSO______________
+REPOSO:
+	ACALL 	GEN_EVE_REPOSO			; Llamada al generador de eventos de este estado
+	MOV 	A, 		EVENTO
+	RL 	A
+	MOV 	DPTR,		#EVENTOS_REPOSO	; Misma estructura que con la maquina de estados
+	JMP 	@A+DPTR
+	
+EVENTOS_REPOSO:
+	AJMP 	E0_EV0				; estado 0 evento 0
+	AJMP  	E0_EV1				; estado 0 evento 1
+
+GEN_EVE_REPOSO:	
+	MOV	EVENTO,		#00h		; como solo hay dos eventos y dependen exclusivamente del bit
+	MOV	A,		ON
+        MOV     EVENTO,      	A	        ; del pin de entrada del boton OnOff, nos ahorramos mas programa
+RET
+
+E0_EV0:						; evento vacio
+	
+        CLR	EAD
+        CLR     TR0
+        ORL	PCON,		#01h
+
+RET
+
+E0_EV1:	
+	SETB	EAD
+        SETB    TR0                         	; habilita la interrupcion por overflow del timer 0	
+						; on/off pulsado, pasar a estado deteccion
+	MOV	PCON,	        00h		; desactivar el IDL mode (modo de bajo consumo)
+	SETB	PARPADEO			; ponemos la variable parpadeo a 1
+	ACALL 	ACT_DISPLAY			; actualizar el display con la potencia (0)
+	SETB 	LED				; encender el led
+	ACALL   PITIDO				; hacemos que suene un pitido
+	MOV	ESTADO,		#01h
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0
+RET
+
+
+						;______________ESTADO 1: DETECCION______________
+DETECCION:
+	ACALL 	GEN_EVE_DETECCION		; Llamada al generador de eventos de este estado
+	MOV 	A, 	      EVENTO
+	MOV 	DPTR, 	      #EVENTOS_DETECCION; Misma estructura que con la maquina de estados
+	RL 	A
+	JMP 	@A+DPTR
+
+EVENTOS_DETECCION:
+	AJMP 	E1_EV0				; estado 1 evento 0
+	AJMP  	E1_EV1				; estado 1 evento 1
+	AJMP  	E1_EV2				; estado 1 evento 2
+	AJMP  	E1_EV3				; estado 1 evento 3
+	AJMP  	E1_EV4				; estado 1 evento 4
+	AJMP  	E1_EV5				; estado 1 evento 5
+	AJMP  	E1_EV6				; estado 1 evento 6
+	AJMP  	E1_EV11				; estado 1 evento 11
+	AJMP  	E1_EV15				; estado 1 evento 15		
+
+GEN_EVE_DETECCION:				; hay que comprobar varios sensores
+	MOV	EVENTO,		#00h
+	CLR	C
+	MOV	A,		TEMP		; mover todos los bits
+	SUBB	A,		#15h		; comparamos si la temperatura es mayor que 40 grados. Como solo usamos
+						; los 8 bits mas significativos, vamos a prescindir de 2 bits que estan
+						; en el ADCI. Ademas se usa la formula de (10mV/1Cº) para obtener la corriente
+						; en voltios respecto a cada temperatura: 40º -> Vo= 0.4V --> Vd= 82b
+						; esta corriente la haremos entre 4 porque hemos prescindido de 2 bits.
+						; por tanto, Vd/4 --> 21b --> 15h
+	JNC	HAY_TEMP
+        CLR     C
+        MOV	A,		ON		; movemos ON al acumulador
+	ANL	A,		#01h		; comprobamos si es cero
+	JZ	APAGAR_FOG
+	JB 	P3.3,      	HAY_RECIP	; comprueba si el recipiente está puesto
+	MOV	A,		#00h
+	JB	F_15S,		QUINCE_SEG
+	FIN_DETECC:
+RET	
+
+HAY_TEMP:
+	
+	MOV	EVENTO,		#06h
+	SJMP	FIN_DETECC
+
+APAGAR_FOG:
+
+	MOV	EVENTO,		#01h
+	SJMP	FIN_DETECC
+
+
+HAY_RECIP:
+
+	MOV 	EVENTO,		#04h
+	JMP 	FIN_DETECC
+
+QUINCE_SEG:  
+
+        MOV	EVENTO,		#05h
+
+RET
+		
+
+E1_EV0:						; evento vacio	
+				
+RET
+
+E1_EV1:						; pulsar OnOff (en este caso hay que apagar el fogon)
+	CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+	
+	ACALL   PITIDO				; hacemos que suene un pitido
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	CLR 	LED				; apagar el led
+	MOV	ESTADO,		#00h		; pasamos al estado de reposo 
+	MOV	P5,		#00h
+	MOV	EVENTO,		#00h	
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)
+
+RET
+
+E1_EV2:						; pulsar ( + ),	no se hace nada		
+				
+RET
+
+E1_EV3:						; pulsar ( - ),	no se hace nada		
+						
+RET
+
+E1_EV4:	
+		   				; detecta el recipiente					
+	MOV	ESTADO, 	#02h		; pasamos al estado de encendido sin potencia
+	MOV	PARPADEO,	#01h		; ponemos la variable parpadeo a 1
+	ACALL 	ACT_DISPLAY			; actualizar el display con la potencia (0)	
+	ACALL   PITIDO				; hacemos que suene un pitido
+	MOV	ON,		#01h									
+RET
+
+E1_EV5:	
+	CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+						; si no detecta el recipiente en 15s y 30sec=0	
+	MOV	ON,		#00h		; poner a 0 la variable ON	
+	MOV	ESTADO, 	#00h		; pasamos al estado de Reposo (IDL)
+	MOV	EVENTO,		#00h	
+	ACALL   PITIDO				; hacemos que suene un pitido	
+	CLR 	LED				; apagar el led
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)
+		
+RET
+
+E1_EV6:						; si temp>40 y on=0 y han pasado 30 segundos
+			
+	MOV	ESTADO,		#04h
+	MOV	ON,		#00h
+						
+RET
+
+E1_EV11:
+		
+	CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+						; si on = 0		
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	MOV	ESTADO, 	#00h		; pasamos al estado de Reposo (IDL)
+	ACALL   PITIDO				; hacemos que suene un pitido
+	CLR 	LED				; apagar el led
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0	
+	MOV	EVENTO,		#00h	
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)
+			
+RET
+
+E1_EV15:
+	CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+						; si no detecta el recipiente en 30 segundos
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	MOV	ESTADO, 	#00h
+	ACALL   PITIDO				; hacemos que suene un pitido
+	CLR 	LED				; apagar el led
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0	
+	MOV	EVENTO,		#00h			
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)				
+RET
+
+
+PITIDO:
+
+	SETB	ZUMBADOR			; ponemos a uno el zumbador, para que haga el pitido.
+						; esto va a durar como mucho 1 segundo, ya que en el timer
+						; se pone cada segundo a cero el zumbador
+RET		
+
+
+						;______________ESTADO 2: ENCENDIDO SIN POTENCIA______________
+ENC_SP:
+
+	ACALL 	GEN_EVE_ENC_SP
+	MOV 	A, 		EVENTO
+	MOV 	DPTR, 		#EVENTOS_ENC_SP
+	RL 	A
+	JMP 	@A+DPTR
+
+EVENTOS_ENC_SP:
+
+	AJMP 	E2_EV0				; estado 2 evento 0
+	AJMP  	E2_EV1				; estado 2 evento 1
+	AJMP  	E2_EV2				; estado 2 evento 2
+	AJMP  	E2_EV3				; estado 2 evento 3
+	AJMP  	E2_EV7				; estado 2 evento 7
+	AJMP  	E2_EV8				; estado 2 evento 8
+	AJMP  	E2_EV10				; estado 2 evento 10
+        AJMP    E2_EV15                         ; estado 2 evento 15
+	AJMP  	E2_EV16				; estado 2 evento 16	
+
+GEN_EVE_ENC_SP:
+
+	MOV	EVENTO,		00h
+       	MOV	A,		ON		; movemos ON al acumulador
+	SUBB	A,		#01h		; comprobamos si es cero
+	JC	APAGAR_FOG_SP				
+	JNB 	P3.3,   	NO_HAY_RECIP	; comprueba si el recipiente está puesto
+	JB	P3.0,		SUM_POT		; comprueba si se ha pulsado el boton ( + )
+	MOV	A,		POTANT
+	ANL	A,		00h
+	JNZ	P_ANT_NOCERO
+        JB	F_30S,		TREINTA_SEG
+	FIN_SP:
+RET	
+
+
+TREINTA_SEG:
+	
+	MOV	EVENTO,		#07h
+RET
+
+APAGAR_FOG_SP:
+
+	MOV	EVENTO,		#01h
+	SJMP	FIN_SP
+
+
+
+SESENTA_SEG:
+
+	MOV	EVENTO,		#04h
+RET 
+	
+NO_HAY_RECIP:
+
+	MOV 	EVENTO,		#05h		; Saltar al evento 8
+RET
+	
+P_ANT_NOCERO:
+
+	MOV	EVENTO, 	#06h
+RET
+
+E2_EV0:						; evento vacio
+	ACALL	ACT_DISPLAY			; actualiza el display
+RET
+
+E2_EV1:						; pulsar OnOff (en este caso hay que apagar el fogon)
+						; y la potencia efectiva tiene que ser cero
+	MOV 	ESTADO, 	#01h		; pasar al estado deteccion
+	MOV 	POTENCIA,	#00h		; potencia = 0
+	MOV 	POTANT,		#00h		; potenciaAnt = 0
+	CLR	PARPADEO			; ponemos a 0 el parpadeo
+	MOV	ON,		#00h		; poner a 0 la variable ON
+RET					
+
+E2_EV2:						
+						; pulsar ( + )
+	MOV 	ESTADO, 	#03h		; pasar al estado encendido con potencia
+	MOV 	POTENCIA,	#01h		; potencia = 1
+	ACALL	PROGRAMAR_PWM			; se programa el pwm
+	MOV	PWM0,		A
+	CLR	PARPADEO
+
+RET						
+
+E2_EV3:	
+						; pulsar ( - ) , no deberia de hacer nada	
+	ACALL	ACT_DISPLAY_POTANT		; actualiza el display
+
+RET
+
+E2_EV7:	
+						; Un minuto sin pulsar +
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	MOV	ESTADO, 	#00h		; pasamos al estado de Reposo (IDL)	
+	ACALL   PITIDO				; hacemos que suene un pitido
+	CLR 	LED				; apagar el led
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0
+	CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+	MOV	EVENTO,		#00h	
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)
+
+RET
+
+E2_EV8:	
+						; Recipiente retirado
+	MOV 	ESTADO, 	#01h		; pasar al estado deteccion
+	MOV 	POTENCIA,	#00h		; potencia = 0
+	MOV 	POTANT,		#00h		; potenciaAnt = 0
+	CLR	PARPADEO			; ponemos a 0 el parpadeo
+RET
+
+
+E2_EV10:
+						; potenciaAnterior != 0	
+	MOV 	ESTADO, 	03h		; pasar al estado encendido con potencia
+	MOV	A,		POTANT		; movemos a A la potencia anterior
+	MOV	POTENCIA,	A		; movemos a potencia lo que haya en A (la potencia ant)
+	MOV	POTANT,		#00h		; ponemos la potencia anterior a 0
+	CLR	PARPADEO
+RET
+
+E2_EV15:
+        CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+						; si on = 0		
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	MOV	ESTADO, 	#00h		; pasamos al estado de Reposo (IDL)
+	ACALL   PITIDO				; hacemos que suene un pitido
+	CLR 	LED				; apagar el led
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0	
+	MOV	EVENTO,		#00h	
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)
+RET
+
+E2_EV16:
+						; potenciaAnterior == 0	
+	ACALL	E2_EV0
+RET
+
+SUM_POT:
+        JB      B_MAS,          FIN_SUM
+        SETB    B_MAS
+	MOV	EVENTO,		#02h		; Saltar al evento 2
+        SETB    B_MAS
+        FIN_SUM:
+RET			
+		
+						;______________ESTADO 3: ENCENDIDO CON POTENCIA______________
+ENC_CP:
+
+	ACALL 	GEN_EVE_ENC_CP
+	MOV 	A, 		EVENTO
+	MOV 	DPTR, 		#EVENTOS_ENC_CP
+	RL 	A
+	JMP 	@A+DPTR
+
+EVENTOS_ENC_CP:
+
+	AJMP 	E3_EV0				; estado 3 evento 0
+	AJMP  	E3_EV1				; estado 3 evento 1
+	AJMP  	E3_EV2				; estado 3 evento 2
+	AJMP  	E3_EV3				; estado 3 evento 3
+	AJMP  	E3_EV8				; estado 3 evento 8
+	AJMP  	E3_EV9				; estado 3 evento 9	
+
+GEN_EVE_ENC_CP:	
+				
+	MOV	EVENTO,		#00h		
+	JNB 	P3.3,  		NO_RECIP	; comprueba si el recipiente está puesto
+       	MOV	A,		ON		; movemos ON al acumulador
+	SUBB	A,		#01h		; comprobamos si es cero
+	JC	APAGAR_FOG_CP
+        CLR     C
+        JNB     P3.0,           NO_MAS
+        CP_SEGUIR1:
+        JNB     P3.1,           NO_MENOS
+
+        CP_SEGUIR2:
+
+	JB	P3.0,  		SUM_POT
+	JB	P3.1,  		MEN_POT
+	
+	FIN_CP:
+
+	RET
+NO_MAS:
+        CLR     B_MAS 
+        AJMP    CP_SEGUIR1
+
+NO_MENOS:
+        CLR     B_MENOS
+        AJMP    CP_SEGUIR2
+
+APAGAR_FOG_CP:
+
+	MOV	EVENTO,		#01h
+	SJMP	FIN_CP
+
+NO_RECIP:
+
+	MOV	EVENTO,		#04h 
+	SJMP	FIN_CP
+
+MEN_POT:
+
+	JB      B_MENOS,        FIN_MENOS
+	MOV	A,		POTENCIA
+	SUBB	A,		#02h
+	JC	POT_ES_UNO
+
+        SETB    B_MENOS
+        CLR     C
+	DEC	POTENCIA
+        MOV     EVENTO,         #03h
+        FIN_MENOS:
+RET   
+
+
+POT_ES_UNO:
+
+	MOV	EVENTO,	 	#05h
+        CLR     C
+	SJMP	FIN_CP
+
+
+E3_EV0:	
+						; evento vacio
+						
+RET
+
+E3_EV1:						; pulsar OnOff
+	
+	ACALL   PITIDO				; hacemos que suene un pitido
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	CLR 	LED				; apagar el led
+	MOV	A,		POTENCIA	; movemos a A la potencia 
+	MOV	POTANT,		A		; movemos a potencia ant lo que haya en A (la potencia)
+	MOV	POTENCIA,	#00h		; poner a 0 la potencia
+	MOV	ESTADO,		#02h		; pasamos al estado de Encendido Sin Potencia
+RET
+
+E3_EV2:	
+						; pulsar ( + )
+	MOV	A,		#09h
+	SUBB	A,		POTENCIA
+	JC	ES_DIEZ  			; Si fuese 10 displayeamos potencia
+	INC	POTENCIA			; Si no es 10, incrementa
+	MOV	A,		POTENCIA
+	ACALL	PROGRAMAR_PWM			; se programa el pwm
+	MOV	PWM0,		A
+	ACALL	ACT_DISPLAY
+	E3_EV2_FIN:
+RET
+	
+
+E3_EV3:	
+						; pulsar ( - )
+	;DEC	POTENCIA			; Si no es 1, decrece
+	ACALL	PROGRAMAR_PWM			; se programa el pwm
+	MOV	PWM0,		A
+	ACALL	ACT_DISPLAY
+RET
+
+
+E3_EV8:	
+						; Recipiente retirado
+	MOV	ESTADO,		#02h		; pasamos al estado de Encendido Sin Potencia
+	MOV	A,		POTENCIA	; movemos a A la potencia 
+	MOV	POTANT,		A		; movemos a potencia ant lo que haya en A (la potencia)
+	MOV	POTENCIA,	#00h		; ponemos la potencia a 0
+	MOV	PARPADEO,	#01h
+RET
+
+E3_EV9:	
+
+	DEC	POTENCIA			; pulsar ( - ) y potencia = 1
+	MOV	ESTADO,		#02h		; pasamos al estado de Encendido Sin Potencia
+	MOV	POTENCIA,	#00h
+	MOV 	POTANT,		#00h
+	MOV	PARPADEO,	#01h
+RET
+
+
+
+CAMBIAR_A_EV_9:
+
+	MOV	EVENTO,		#05h
+
+RET
+
+ES_DIEZ:
+	MOV	POTENCIA,	#0Ah
+	MOV	A,		POTENCIA
+	ACALL	PROGRAMAR_PWM			; se programa el pwm
+	MOV	PWM0,		A
+	ACALL	ACT_DISPLAY
+	SJMP	E3_EV2_FIN
+
+
+
+						;______________ESTADO 4: TEMPERATURA ALTA______________
+TEMP_ALTA:
+
+	ACALL 	GEN_EVE_TEMP_ALTA
+	MOV 	A, 		EVENTO
+	MOV 	DPTR, 		#EVENTOS_TEMP_ALTA
+	RL 	A
+	JMP 	@A+DPTR
+
+
+EVENTOS_TEMP_ALTA:
+
+	AJMP 	E4_EV0				; estado 4 evento 0
+	AJMP  	E4_EV1				; estado 4 evento 1
+	AJMP  	E4_EV12				; estado 4 evento 12
+	AJMP  	E4_EV13				; estado 4 evento 13
+	AJMP  	E4_EV14				; estado 4 evento 14
+
+GEN_EVE_TEMP_ALTA:				
+	MOV     PWM0,           #0FFh
+	MOV	EVENTO,		#00h
+	MOV	A,		ON		; movemos ON al acumulador
+	ANL	A,		#01h		; comprobamos si es cero
+	JNZ	ENC_FOG
+	JB	F_ADC,		FIN_ADC		; que salte a la subrutina si la flag del adc esta a 1
+	FIN_TEMPALT:
+	RET
+
+ENC_FOG:
+
+	MOV	EVENTO,		#01h
+	SJMP 	FIN_TEMPALT
+
+FIN_ADC:
+
+	CLR	C
+	CLR	F_ADC				; limpiamos la flag del adc
+	MOV	A,		TEMP 		; mover todos los bits
+	SUBB	A,		#29h		; comparamos si la temperatura es mayor que 80 grados. Como solo usamos
+						; los 8 bits mas significativos, vamos a prescindir de 2 bits que estan
+						; en el ADCI. Ademas se usa la formula de (10mV/1Cº) para obtener la corriente
+						; en voltios respecto a cada temperatura: 80º -> Vo= 0.8V --> Vd= 164b
+						; esta corriente la haremos entre 4 porque hemos prescindido de 2 bits.
+						; por tanto, Vd/4 --> 41b --> 29h
+	JNC	TEMP_MAS_80
+	CLR	C
+
+	MOV	A,		TEMP		; mover todos los bits
+	SUBB	A,		#15h		; comparamos si la temperatura es mayor que 40 grados. Como solo usamos
+						; los 8 bits mas significativos, vamos a prescindir de 2 bits que estan
+						; en el ADCI. Ademas se usa la formula de (10mV/1Cº) para obtener la corriente
+						; en voltios respecto a cada temperatura: 40º -> Vo= 0.4V --> Vd= 82b
+						; esta corriente la haremos entre 4 porque hemos prescindido de 2 bits.
+						; por tanto, Vd/4 --> 21b --> 15h
+	JNC	TEMP_40_80
+	JC	TEMP_MENOS_40
+	SJMP	FIN_TEMPALT
+
+TEMP_MAS_80:
+
+	MOV	EVENTO,		#03h
+	SJMP	FIN_TEMPALT		
+
+TEMP_40_80:
+
+	MOV	EVENTO,		#04h		
+	SJMP	FIN_TEMPALT	
+
+TEMP_MENOS_40:
+
+	MOV	EVENTO,		#02h
+	SJMP	FIN_TEMPALT
+						;______________ACTUALIZAR EL DISPLAY______________
+ACT_DISPLAY:
+						
+	MOV 	A,		POTENCIA
+	ACALL 	SIETE_SEG			; llamamos a la subrutina
+RET	
+	
+
+E4_EV0:						; evento vacio
+
+RET
+
+E4_EV1:						; pulsar OnOff
+	
+	SETB	PARPADEO			; ponemos la variable parpadeo a 1
+	ACALL 	ACT_DISPLAY			; actualizar el display con la potencia (0)
+	SETB 	LED				; encender el led
+	ACALL   PITIDO				; hacemos que suene un pitido de encendido
+	MOV	ON,		#01h		; poner a 1 la variable ON
+	MOV	ESTADO,		#01h
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0
+RET
+
+E4_EV12:					; Temperatura < 40
+
+	MOV	ON,		#00h		; poner a 0 la variable ON
+	MOV	ESTADO, 	#00h		; pasamos al estado de Reposo (IDL)
+	CLR	TR0				; deshabilita el timer
+	CLR	EAD				; deshabilita la interrupcion por adc
+	SETB   	IE.0 				; habilita la interrupcion externa 0 del boton ON OFF Pin, 3.2
+	CLR 	LED				; apagar el led
+	MOV 	POTENCIA,	00h		; Potencia a 0
+	MOV 	POTANT,		00h		; Potencia anterior a 0	
+	MOV	EVENTO,		#00h	
+	MOV	PCON,	        #01h		; activar el IDL mode (modo de bajo consumo)
+
+RET
+E4_EV13:					; Temperatura > 80
+	
+	MOV	POTENCIA,	#0Bh		; para hacer la H pequeña
+	ACALL 	ACT_DISPLAY			; actualizar el display con la potencia
+	MOV	POTENCIA,	#00h
+
+
+RET
+
+E4_EV14:					; 80 > Temperatura > 40
+
+	MOV	POTENCIA,	#0Ch		; para hacer la H pequeña
+	ACALL 	ACT_DISPLAY			; actualizar el display con la potencia
+	MOV	POTENCIA,	#00h
+
+RET						
+ 	
+
+						
+						;______________ACTUALIZAR EL DISPLAY CON POTENCIA ANTERIOR______________
+ACT_DISPLAY_POTANT:
+						
+	MOV 	A, 	POTANT
+	ACALL 	SIETE_SEG			; llamamos a la subrutina
+			
+RET
+
+				
+						;______________CONTADOR (TIMERS)______________
+CONTADOR:
+
+        INC     T0REG0
+        MOV     A,      	T0REG0          ; movemos el contenido del registro de los 8 primeros bits del contador al acumulador
+        CLR	C
+	SUBB    A,      	CT0REG0         ; mascara para comprobar si se lleva 1 segundo
+        JZ      UN_SEG 				; si el registro esta lleno, saltar a unseg
+RET
+
+UN_SEG:		
+						; de esta manera cada segundo parpadeará
+	MOV	T0REG0,		#00h		
+	MOV	A,		#00h
+	ACALL 	CONV_BCD			; llamamos al conversor BCD
+	ACALL 	PONER_PUERTO			; hacemos que se ponga en el puerto el bit que hemos asignado
+	INC	SEGUNDOS
+	CLR	ZUMBADOR			; con esto consegumos que el pitido dure como mucho 1 segundo	
+        ACALL   CONTAR_SEGS			; 
+RET
+                                                ; volver a contar si ha llegado o a un segundo
+
+CONTAR_SEGS:
+
+	MOV	A,		SEGUNDOS
+	SUBB	A,		#3Ch		; comprobar si han pasado 60 segundos
+	JNC	ACTIVAR_F_60S
+	CLR	C
+
+	MOV	A,		SEGUNDOS
+	SUBB	A,		#1Eh		; comprobar si han pasado 30 segundos
+	JNC	ACTIVAR_F_30S
+	CLR 	C
+
+	MOV	A,		SEGUNDOS
+	SUBB	A,		#0Fh		; comprobar si han pasado 15 segundos
+	JNC	ACTIVAR_F_15S
+	CLR	C
+	
+
+
+RET
+
+
+ACTIVAR_F_15S:
+
+	SETB	F_15S				; poner a 1 la flag de 15 segundos
+	ACALL	RST_CONT
+RET
+
+ACTIVAR_F_30S:
+
+	SETB	F_30S				; poner a 1 la flag de 30 segundos
+	ACALL	RST_CONT
+RET
+
+ACTIVAR_F_60S:
+
+	SETB	F_60S
+	ACALL	RST_CONT			; poner a 1 la flag de 60 segundos
+RET
+
+RST_CONT:
+
+        MOV     T0REG0, 	#0x00			; poner a cero el contenido de todos los bits del contador
+RET
+
+
+                                                ;______________DISPLAY SIETE SEGMENTOS______________
+SIETE_SEG:
+                                                ; POTENCIA=10, P. POTENCIA=11, H.  POTENCIA = 12, h.
+	ACALL 	CONV_BCD			; convertimos el numero a bcd
+	ACALL 	PONER_PUERTO
+	MOV 	DISPLAY, 	A				
+	RET
+
+
+PROGRAMAR_PWM:
+
+	MOV	A,		POTENCIA	; Si la Potencia es 0
+	INC	A
+        MOVC    A,      	@A+PC           ; usamos el movc
+        RET
+	DB     0XFF 	                        ; Definimos el bit del PWM0 (D=0)
+	DB     0XE6 	                        ; D= 1-(E6/FF)
+	DB     0XCC 	                        ; D= 1-(CC/FF)
+	DB     0XB3 	                        ; D= 1-(B3/FF) 
+	DB     0X99 	                        ; D= 1-(99/FF)	
+	DB     0X80 	                        ; D= 1-(80/FF)	
+	DB     0X66 	                        ; D= 1-(66/FF)	
+	DB     0X4D 	                        ; D= 1-(4D/FF)	
+	DB     0X33 	                        ; D= 1-(33/FF)	
+	DB     0X1A 	                        ; D= 1-(1A/FF)	 
+	DB     0X00 	                        ; D= 1
+	
+					        ;______________CONVERSOR BINARIO A BCD______________
+CONV_BCD:
+        INC 	A				; pasar la potencia al acumulador
+        MOVC 	A, 		@A + PC
+        RET
+        DB      01111110b			; este conversor dependiendo de la potencia, va a dar un valor u otro
+        DB      00110000b                       ; para 0-> 1111110., para 1->0110000....
+        DB      01101101b			; 2
+        DB      01111001b			; 3
+        DB      00110011b			; 4
+        DB      01011011b			; 5
+        DB      01011111b			; 6
+        DB      01110000b			; 7
+        DB      01111111b			; 8
+        DB      01111011b			; 9
+        DB      01100111b                       ; P de potencia maxima
+        DB      00110111b                       ; H de temperatura >80
+        DB      00010111b                       ; h de temperatura 40<temp<80
+
+INT_ONOFF:					;______________SUBRUTINA ON OFF______________
+
+						; Se hacen en esta posicion de memoria para evitar problemas de espacio
+	PUSH 	ACC				; Moveremos el acumulador y el PSW al Stack para no perderlos
+	PUSH 	PSW				; al ejecutar la rutina de atencion a la interrupcion
+	MOV	A,		ON		; movemos ON al acumulador
+	ANL	A,		#01h		; comprobamos si es cero
+	JNZ	ESUNO				; si es uno saltamos
+	MOV	ON,		#01h		; ponemos a uno el ON en caso de ser cero
+	SETB    TR0                             ; inicia el timer
+	SETB	EAD
+	ANL     ADCON,          #0E7h		; poner el adc al canal 000 y ADCI a 0
+	ORL	ADCON,		#08h		; iniciar la conversión del adc
+	SETB   	IE.7 				; habilita todas las interrupciones
+	MOV	ESTADO, 	#00h		; pasamos al estado de Reposo
+	DENTRO_ONOFF:
+
+	POP 	ACC				; Obtenemos de vuelta del Stack el acumulador y el PSW
+	POP 	PSW				; con eso nos aseguramos de volver a los mismos valores
+
+	RET
+ESUNO:						; ponemos a cero el ON en caso de ser uno
+
+	MOV	ON,	#00h			
+	SJMP	DENTRO_ONOFF
+
+PONER_PUERTO:
+
+	MOV	P0,		A		; mover lo que haya en el acumulador al puerto 0
+	RET					; que es el display de siete segmentos
+
+INT_ADC:					;______________INTERRUPCION ADC______________
+
+	PUSH 	ACC				; Moveremos el acumulador y el PSW al Stack para no perderlos
+	PUSH 	PSW				; al ejecutar la rutina de atencion a la interrupcion
+	MOV	A,		ADCH
+	MOV	TEMP,		A
+	SETB 	F_ADC				; Ponemos a 1 el flag del ADC
+	ANL 	ADCON, 		#0EFh		; limpiamos el valor del ADCON
+						; Por tanto solo modificamos el bit 4, que es la flag del ADC
+						; pero el resto del adc sigue igual
+	ORL	ADCON,		#08h		; iniciar la conversión del adc
+
+	POP 	PSW
+	POP 	ACC				; Obtenemos de vuelta del Stack el acumulador y el PSW
+						; con eso nos aseguramos de volver a los mismos valores
+						; que al principio de la interrupcion
+
+	RET
+
+INT_TIMER:					;______________INTERRUPCION TIMER______________
+
+	PUSH 	ACC				; Moveremos el acumulador y el PSW al Stack para no perderlos
+	PUSH 	PSW				; al ejecutar la rutina de atencion a la interrupcion
+        MOV 	TL0, 		#3Ch		; valor de precarga para que el timer salte cada 0.025s
+	MOV 	TH0, 		#3Ch		; 
+	ACALL 	CONTADOR			; llamamos a una subrutina 
+	POP 	PSW				; con eso nos aseguramos de volver a los mismos valores
+	POP 	ACC				; Obtenemos de vuelta del Stack el acumulador y el PSW
+						; que al principio de la interrupcion
+	RET
+
+END
